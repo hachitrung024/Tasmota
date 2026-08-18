@@ -23,6 +23,10 @@
 
 // #define DEBUG_DUMP_TLS    // allow dumping of TLS Flash keys
 
+#if defined(USE_MQTT_AZURE_IOT) && defined(USE_MQTT_TB_IOT)
+  #error USE_MQTT_AZURE_IOT and USE_MQTT_TB_IOT cannot be enabled together
+#endif
+
 #ifdef USE_MQTT_TLS
   #include "WiFiClientSecureLightBearSSL.h"
   BearSSL::WiFiClientSecure_light *tlsClient;
@@ -43,6 +47,10 @@ WiFiClient EspClient;                     // Wifi Client - non-TLS
   #include <t_bearssl.h>
   #include <JsonParser.h>
 #endif  // USE_MQTT_AZURE_IOT
+
+#ifdef USE_MQTT_TB_IOT
+  #include <JsonParser.h>
+#endif  // USE_MQTT_TB_IOT
 
 const char kMqttCommands[] PROGMEM = "|"  // No prefix
 #ifndef FIRMWARE_MINIMAL
@@ -477,6 +485,378 @@ void MqttInit(void) {
 #endif // USE_MQTT_AZURE_DPS_SCOPEID
 #endif // USE_MQTT_AZURE_IOT
 
+#ifdef USE_MQTT_TB_IOT
+
+const char kMqttTbTelemetryTopic[] = "v1/devices/me/telemetry";
+const char kMqttTbAttributesTopic[] = "v1/devices/me/attributes";
+const char kMqttTbRpcRequestTopic[] = "v1/devices/me/rpc/request/+";
+const char kMqttTbRpcRequestPrefix[] = "v1/devices/me/rpc/request/";
+const char kMqttTbRpcResponsePrefix[] = "v1/devices/me/rpc/response/";
+
+const uint32_t MQTT_TB_MAX_JSON_SIZE = MQTT_MAX_PACKET_SIZE;
+const uint32_t MQTT_TB_MAX_FLATTEN_DEPTH = 8;
+
+bool MqttTbPublishDirect(const char *topic, const char *payload, uint32_t payload_len) {
+  if ((nullptr == topic) || (nullptr == payload) || (payload_len > MQTT_TB_MAX_JSON_SIZE)) {
+    AddLog(LOG_LEVEL_ERROR, PSTR(D_LOG_MQTT "ThingsBoard publish rejected: invalid topic or payload size"));
+    return false;
+  }
+
+  if (!MqttClient.beginPublish(topic, payload_len, false)) {
+    AddLog(LOG_LEVEL_ERROR, PSTR(D_LOG_MQTT "ThingsBoard publish failed for topic '%s'"), topic);
+    return false;
+  }
+
+  uint32_t written = MqttClient.write((const uint8_t*)payload, payload_len);
+  if (written != payload_len) {
+    AddLog(LOG_LEVEL_ERROR, PSTR(D_LOG_MQTT "ThingsBoard partial write (%u/%u), dropping connection"), written, payload_len);
+    MqttClient.disconnect();
+    return false;
+  }
+
+  MqttClient.endPublish();
+  delay(0);
+  return true;
+}
+
+bool MqttTbTopicHasPrefix(const String &topic, const char *prefix) {
+  if ((nullptr == prefix) || ('\0' == prefix[0])) { return false; }
+
+  const size_t prefix_len = strlen(prefix);
+  int32_t segment_start = 0;
+  while (segment_start < (int32_t)topic.length()) {
+    int32_t segment_end = topic.indexOf('/', segment_start);
+    if (-1 == segment_end) { segment_end = topic.length(); }
+    if (((size_t)(segment_end - segment_start) == prefix_len) &&
+        !strncmp(topic.c_str() + segment_start, prefix, prefix_len)) {
+      return true;
+    }
+    segment_start = segment_end + 1;
+  }
+  return false;
+}
+
+bool MqttTbTokenBoundsValid(const JsonParserToken &token, const String &source) {
+  return token.isValid() &&
+         (token.t->start <= source.length()) &&
+         (token.t->len <= source.length() - token.t->start);
+}
+
+bool MqttTbTokenToJson(const JsonParserToken &token, const String &source, String &value) {
+  if (!MqttTbTokenBoundsValid(token, source) || token.isNull()) { return false; }
+
+  String raw = source.substring(token.t->start, token.t->start + token.t->len);
+  if (token.isStr()) {
+    value = '"';
+    value += raw;
+    value += '"';
+  } else {
+    value = raw;
+  }
+  return true;
+}
+
+bool MqttTbTokenToCommand(const JsonParserToken &token, const String &source, String &value) {
+  if (!MqttTbTokenBoundsValid(token, source)) { return false; }
+
+  if (token.isObject() || token.isArray()) {
+    value = source.substring(token.t->start, token.t->start + token.t->len);
+  } else {
+    value = token.getStr();
+  }
+  return value.length() < MQTT_TB_MAX_JSON_SIZE;
+}
+
+bool MqttTbAppendFlatValue(JsonParser &parser, const JsonParserToken &token, const String &source,
+                           const String &key, String &target, bool &first_key) {
+  if (token.isNull()) { return true; }
+  if (!key.length() || (key.length() >= TOPSZ)) {
+    AddLog(LOG_LEVEL_ERROR, PSTR(D_LOG_MQTT "ThingsBoard telemetry key is empty or too long"));
+    return false;
+  }
+
+  parser.setCurrent();
+  String value;
+  if (!MqttTbTokenToJson(token, source, value)) { return false; }
+
+  String escaped_key = EscapeJSONString(key.c_str());
+  uint32_t required = target.length() + escaped_key.length() + value.length() + 5;
+  if (required > MQTT_TB_MAX_JSON_SIZE) {
+    AddLog(LOG_LEVEL_ERROR, PSTR(D_LOG_MQTT "ThingsBoard flattened telemetry exceeds %u bytes"), MQTT_TB_MAX_JSON_SIZE);
+    return false;
+  }
+
+  if (!first_key) { target += ','; }
+  target += '"';
+  target += escaped_key;
+  target += F("\":");
+  target += value;
+  first_key = false;
+  return true;
+}
+
+bool MqttTbFlattenObject(JsonParser &parser, const JsonParserObject &object, const String &source,
+                         const String &prefix, String &target, bool &first_key, uint32_t depth) {
+  for (const auto key_token : object) {
+    parser.setCurrent();
+    String child_name = key_token.getStr();
+    JsonParserToken value_token = key_token.getValue();
+    String child_key = prefix;
+    if (child_key.length()) { child_key += '-'; }
+    child_key += child_name;
+
+    if (value_token.isObject() && (depth < MQTT_TB_MAX_FLATTEN_DEPTH)) {
+      if (!MqttTbFlattenObject(parser, value_token.getObject(), source, child_key, target, first_key, depth + 1)) {
+        return false;
+      }
+    } else if (!MqttTbAppendFlatValue(parser, value_token, source, child_key, target, first_key)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool MqttTbFlattenTelemetry(JsonParser &parser, const JsonParserObject &root, const String &source, String &target) {
+  target = '{';
+  bool first_key = true;
+
+  for (const auto sensor_key : root) {
+    parser.setCurrent();
+    String sensor_name = sensor_key.getStr();
+    JsonParserToken sensor_value = sensor_key.getValue();
+    if (sensor_value.isObject()) {
+      if (!MqttTbFlattenObject(parser, sensor_value.getObject(), source, sensor_name, target, first_key, 0)) {
+        return false;
+      }
+    } else if (sensor_value.isArray()) {
+      if (!MqttTbAppendFlatValue(parser, sensor_value, source, sensor_name, target, first_key)) {
+        return false;
+      }
+    }
+  }
+
+  if (first_key) {
+    AddLog(LOG_LEVEL_DEBUG, PSTR(D_LOG_MQTT "ThingsBoard SENSOR payload contains no sensor values"));
+    return false;
+  }
+  target += '}';
+  return target.length() <= MQTT_TB_MAX_JSON_SIZE;
+}
+
+bool MqttTbPreparePublish(const char *source_topic, const uint8_t *source_payload, uint32_t source_len,
+                          String &target_topic, String &target_payload) {
+  if ((nullptr == source_topic) || (nullptr == source_payload) || !source_len ||
+      (source_len >= MQTT_TB_MAX_JSON_SIZE) || memchr(source_payload, '\0', source_len)) {
+    AddLog(LOG_LEVEL_DEBUG, PSTR(D_LOG_MQTT "ThingsBoard ignored invalid or oversized payload"));
+    return false;
+  }
+
+  String topic = source_topic;
+  const char *tele_prefix = SettingsText(SET_MQTTPREFIX3);
+  const char *stat_prefix = SettingsText(SET_MQTTPREFIX2);
+  bool is_telemetry_prefix = MqttTbTopicHasPrefix(topic, strlen(tele_prefix) ? tele_prefix : "tele");
+  bool is_status_prefix = MqttTbTopicHasPrefix(topic, strlen(stat_prefix) ? stat_prefix : "stat");
+  if (!is_telemetry_prefix && !is_status_prefix) { return false; }
+
+  int32_t separator = topic.lastIndexOf('/');
+  if ((-1 == separator) || (separator == (int32_t)topic.length() - 1)) {
+    AddLog(LOG_LEVEL_DEBUG, PSTR(D_LOG_MQTT "ThingsBoard ignored malformed source topic '%s'"), source_topic);
+    return false;
+  }
+  String subtopic = topic.substring(separator + 1);
+
+  String source((const char*)source_payload, source_len);
+  String parse_buffer = source;
+  JsonParser parser((char*)parse_buffer.c_str());
+  if (!parser) {
+    AddLog(LOG_LEVEL_DEBUG, PSTR(D_LOG_MQTT "ThingsBoard ignored non-JSON topic '%s'"), source_topic);
+    return false;
+  }
+
+  if (is_telemetry_prefix && subtopic.equalsIgnoreCase(PSTR(D_RSLT_SENSOR))) {
+    JsonParserObject root = parser.getRootObject();
+    if (!root.isValid() || !target_payload.reserve(source_len + 32) ||
+        !MqttTbFlattenTelemetry(parser, root, source, target_payload)) {
+      AddLog(LOG_LEVEL_ERROR, PSTR(D_LOG_MQTT "ThingsBoard failed to flatten SENSOR payload"));
+      return false;
+    }
+    target_topic = kMqttTbTelemetryTopic;
+  } else {
+    target_payload = source;
+    target_topic = kMqttTbAttributesTopic;
+  }
+  return true;
+}
+
+bool MqttTbCommandNameValid(const String &command) {
+  if (!command.length() || (command.length() + 2 > TOPSZ)) { return false; }
+  for (uint32_t i = 0; i < command.length(); i++) {
+    unsigned char c = command[i];
+    if (!isalnum(c) && ('_' != c)) { return false; }
+  }
+  return true;
+}
+
+String MqttTbErrorResponse(const char *error) {
+  String response = F("{\"status\":\"error\",\"error\":\"");
+  response += EscapeJSONString(error);
+  response += F("\"}");
+  return response;
+}
+
+String MqttTbDispatchCommand(const String &command, const String &value) {
+  if (!MqttTbCommandNameValid(command)) {
+    AddLog(LOG_LEVEL_ERROR, PSTR(D_LOG_MQTT "ThingsBoard rejected invalid command '%s'"), command.c_str());
+    return MqttTbErrorResponse("Invalid Tasmota command name");
+  }
+  if (value.length() >= MQTT_TB_MAX_JSON_SIZE) {
+    AddLog(LOG_LEVEL_ERROR, PSTR(D_LOG_MQTT "ThingsBoard command '%s' payload is too large"), command.c_str());
+    return MqttTbErrorResponse("Command payload is too large");
+  }
+
+  char topic[TOPSZ];
+  snprintf_P(topic, sizeof(topic), PSTR("/%s"), command.c_str());
+  char *data = (char*)malloc(value.length() + 1);
+  if (nullptr == data) { return MqttTbErrorResponse("Out of memory"); }
+  memcpy(data, value.c_str(), value.length() + 1);
+
+  ResponseClear();
+  if (Mqtt.disable_logging) {
+    TasmotaGlobal.masterlog_level = LOG_LEVEL_DEBUG_MORE;
+  }
+
+  bool handled = false;
+#ifdef USE_TASMESH
+#ifdef ESP32
+  handled = MESHinterceptMQTTonBroker(topic, (uint8_t*)data, value.length() + 1);
+#endif  // ESP32
+#endif  // USE_TASMESH
+
+  if (!handled) {
+    XdrvMailbox.index = strlen(topic);
+    XdrvMailbox.data_len = value.length();
+    XdrvMailbox.topic = topic;
+    XdrvMailbox.data = data;
+    handled = XdrvCall(FUNC_MQTT_DATA);
+  }
+
+  if (!handled) {
+    ShowSource(SRC_MQTT);
+    TasmotaGlobal.last_source = SRC_MQTT;
+    CommandHandler(topic, data, value.length());
+  }
+
+  if (Mqtt.disable_logging) {
+    TasmotaGlobal.masterlog_level = LOG_LEVEL_NONE;
+  }
+
+  String response;
+  if (ResponseLength()) {
+    response = ResponseData();
+  } else if (handled) {
+    response = F("{\"status\":\"handled\"}");
+  } else {
+    response = MqttTbErrorResponse("Command returned no response");
+  }
+  free(data);
+  return response;
+}
+
+bool MqttTbRequestIdValid(const String &request_id) {
+  if (!request_id.length() ||
+      (request_id.length() + strlen(kMqttTbRpcResponsePrefix) >= TOPSZ)) {
+    return false;
+  }
+  for (uint32_t i = 0; i < request_id.length(); i++) {
+    if (!isdigit((unsigned char)request_id[i])) { return false; }
+  }
+  return true;
+}
+
+void MqttTbPublishRpcResponse(const String &request_id, const String &response) {
+  if (!MqttTbRequestIdValid(request_id)) { return; }
+  String response_topic = kMqttTbRpcResponsePrefix;
+  response_topic += request_id;
+  MqttTbPublishDirect(response_topic.c_str(), response.c_str(), response.length());
+}
+
+void MqttTbHandleRpc(const String &topic, const String &source) {
+  String request_id = topic.substring(strlen(kMqttTbRpcRequestPrefix));
+  if (!MqttTbRequestIdValid(request_id)) {
+    AddLog(LOG_LEVEL_ERROR, PSTR(D_LOG_MQTT "ThingsBoard rejected invalid RPC request id"));
+    return;
+  }
+
+  String parse_buffer = source;
+  JsonParser parser((char*)parse_buffer.c_str());
+  JsonParserObject root = parser.getRootObject();
+  if (!root.isValid()) {
+    MqttTbPublishRpcResponse(request_id, MqttTbErrorResponse("Invalid RPC JSON payload"));
+    return;
+  }
+
+  parser.setCurrent();
+  JsonParserToken method_token = root["method"];
+  if (!method_token.isStr()) {
+    MqttTbPublishRpcResponse(request_id, MqttTbErrorResponse("RPC method must be a string"));
+    return;
+  }
+  String method = method_token.getStr();
+
+  parser.setCurrent();
+  JsonParserToken params_token = root["params"];
+  String params;
+  if (params_token.isValid() && !MqttTbTokenToCommand(params_token, source, params)) {
+    MqttTbPublishRpcResponse(request_id, MqttTbErrorResponse("Invalid RPC params"));
+    return;
+  }
+
+  String response = MqttTbDispatchCommand(method, params);
+  MqttTbPublishRpcResponse(request_id, response);
+}
+
+void MqttTbHandleAttributes(const String &source) {
+  String parse_buffer = source;
+  JsonParser parser((char*)parse_buffer.c_str());
+  JsonParserObject root = parser.getRootObject();
+  if (!root.isValid()) {
+    AddLog(LOG_LEVEL_ERROR, PSTR(D_LOG_MQTT "ThingsBoard ignored invalid shared attributes JSON"));
+    return;
+  }
+
+  for (const auto key : root) {
+    parser.setCurrent();
+    String command = key.getStr();
+    JsonParserToken value_token = key.getValue();
+    String value;
+    if (!MqttTbTokenToCommand(value_token, source, value)) {
+      AddLog(LOG_LEVEL_ERROR, PSTR(D_LOG_MQTT "ThingsBoard ignored invalid value for attribute '%s'"), command.c_str());
+      continue;
+    }
+    MqttTbDispatchCommand(command, value);
+  }
+}
+
+void MqttTbDataHandler(char *mqtt_topic, uint8_t *mqtt_data, uint32_t data_len) {
+  if ((nullptr == mqtt_topic) || (nullptr == mqtt_data) || !data_len ||
+      (data_len >= MQTT_TB_MAX_JSON_SIZE) || memchr(mqtt_data, '\0', data_len)) {
+    AddLog(LOG_LEVEL_ERROR, PSTR(D_LOG_MQTT "ThingsBoard ignored invalid inbound payload"));
+    return;
+  }
+
+  String topic = mqtt_topic;
+  String source((const char*)mqtt_data, data_len);
+  if (topic.startsWith(kMqttTbRpcRequestPrefix)) {
+    MqttTbHandleRpc(topic, source);
+  } else if (topic == kMqttTbAttributesTopic) {
+    MqttTbHandleAttributes(source);
+  } else {
+    AddLog(LOG_LEVEL_DEBUG, PSTR(D_LOG_MQTT "ThingsBoard ignored unexpected topic '%s'"), mqtt_topic);
+  }
+}
+
+#endif  // USE_MQTT_TB_IOT
+
 bool MqttIsConnected(void) {
   return MqttClient.connected();
 }
@@ -537,6 +917,18 @@ bool MqttPublishLib(const char* topic, const uint8_t* payload, unsigned int plen
   }
   topic = topicString.c_str();
 #endif  // USE_MQTT_AZURE_IOT
+
+#ifdef USE_MQTT_TB_IOT
+  String tb_topic;
+  String tb_payload;
+  if (!MqttTbPreparePublish(topic, payload, plength, tb_topic, tb_payload)) {
+    return true;  // Deliberately suppress MQTT topics/payloads not supported by ThingsBoard
+  }
+  topic = tb_topic.c_str();
+  payload = (const uint8_t*)tb_payload.c_str();
+  plength = tb_payload.length();
+  retained = false;
+#endif  // USE_MQTT_TB_IOT
 
   if (!MqttClient.beginPublish(topic, plength, retained)) {
 //    AddLog(LOG_LEVEL_DEBUG, PSTR(D_LOG_MQTT "Connection lost or message too large"));
@@ -637,9 +1029,12 @@ void MqttDataHandler(char* mqtt_topic, uint8_t* mqtt_data, unsigned int data_len
   }
   strlcpy(topic, newTopic.c_str(), sizeof(topic));
   #endif
+#elif defined(USE_MQTT_TB_IOT)
+  MqttTbDataHandler(mqtt_topic, mqtt_data, data_len);
+  return;
 #else
   strlcpy(topic, mqtt_topic, sizeof(topic));
-#endif  // USE_MQTT_AZURE_IOT
+#endif  // USE_MQTT_AZURE_IOT / USE_MQTT_TB_IOT
   mqtt_data[data_len] = 0;
 
   if (Mqtt.disable_logging) {
@@ -1035,6 +1430,13 @@ void MqttConnected(void) {
     Mqtt.retry_counter_multiplier = 1;
     Mqtt.connect_count++;
 
+#ifdef USE_MQTT_TB_IOT
+    Response_P(PSTR("{\"LWT\":\"Online\"}"));
+    MqttTbPublishDirect(kMqttTbAttributesTopic, ResponseData(), ResponseLength());
+
+    MqttSubscribe(kMqttTbAttributesTopic);
+    MqttSubscribe(kMqttTbRpcRequestTopic);
+#else
     GetTopic_P(stopic, TELE, TasmotaGlobal.mqtt_topic, S_LWT);
     Response_P(PSTR(MQTT_LWT_ONLINE));
     MqttPublish(stopic, true);
@@ -1061,6 +1463,7 @@ void MqttConnected(void) {
     }
 
     XdrvCall(FUNC_MQTT_SUBSCRIBE);
+#endif  // USE_MQTT_TB_IOT
   }
 
   if (Mqtt.initial_connection_state) {
@@ -1251,14 +1654,21 @@ void MqttReconnect(void) {
 #endif  // USE_MQTT_TLS
 
   char stopic[TOPSZ];
+#ifdef USE_MQTT_TB_IOT
+  strlcpy(stopic, kMqttTbAttributesTopic, sizeof(stopic));
+  Response_P(PSTR("{\"LWT\":\"Offline\"}"));
+  bool mqtt_will_retain = false;
+#else
   GetTopic_P(stopic, TELE, TasmotaGlobal.mqtt_topic, S_LWT);
   Response_P(S_LWT_OFFLINE);
+  bool mqtt_will_retain = Settings->flag4.mqtt_no_retain ? false : true;
+#endif  // USE_MQTT_TB_IOT
   if (MqttClient.connect(TasmotaGlobal.mqtt_client,
                          mqtt_user,
                          mqtt_pwd,
                          stopic,                                         // Will topic
                          1,                                              // Will QoS
-                         Settings->flag4.mqtt_no_retain ? false : true,  // No retained last will if "no_retain",
+                         mqtt_will_retain,                               // Will retain flag
                          ResponseData(),                                 // Will message
                          Settings->flag5.mqtt_persistent ? 0 : 1)) {     // Clean Session
 #ifdef USE_MQTT_TLS

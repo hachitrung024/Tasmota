@@ -20,6 +20,15 @@
 #ifndef _USER_CONFIG_OVERRIDE_H_
 #define _USER_CONFIG_OVERRIDE_H_
 #define USE_MQTT_TB_IOT
+#ifndef USE_MQTT_TB_IOT
+  #define USE_MQTT_TB_IOT
+#endif
+#ifndef USE_AHT2x
+  #define USE_AHT2x
+#endif
+#ifdef USE_VEML6070 
+  #undef USE_VEML6070
+#endif
 /*****************************************************************************************************\
  * USAGE:
  *   To modify the stock configuration without changing the my_user_config.h file:

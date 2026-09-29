@@ -21,6 +21,10 @@
 
 #define USE_MQTT_NEW_PUBSUBCLIENT
 
+#ifdef USE_MQTT_THINGSBOARD
+#include "include/tasmota_mqtt_thingsboard.h"
+#endif
+
 // #define DEBUG_DUMP_TLS    // allow dumping of TLS Flash keys
 
 #ifdef USE_MQTT_TLS
@@ -107,6 +111,10 @@ struct MQTT {
   bool mqtt_tls = false;                 // MQTT TLS is enabled
   bool disable_logging = false;          // Temporarly disable logging on some commands
 } Mqtt;
+
+#ifdef USE_MQTT_THINGSBOARD
+MqttThingsBoardRpcResults *MqttThingsBoardRpcActive = nullptr;
+#endif
 
 #ifdef USE_MQTT_TLS
 
@@ -488,6 +496,7 @@ void MqttDisconnect(void) {
 }
 
 void MqttSubscribeLib(const char *topic) {
+#ifndef USE_MQTT_THINGSBOARD
 #ifdef USE_MQTT_AZURE_IOT
   // Azure IoT Hub currently does not support custom topics: https://docs.microsoft.com/en-us/azure/iot-hub/iot-hub-mqtt-support
   String realTopicString = "devices/" + String(SettingsText(SET_MQTT_CLIENT));
@@ -500,22 +509,46 @@ void MqttSubscribeLib(const char *topic) {
   MqttClient.subscribe(topic);
 #endif  // USE_MQTT_AZURE_IOT
   MqttClient.loop();  // Solve LmacRxBlk:1 messages
+#endif  // USE_MQTT_THINGSBOARD
 }
 
+#ifdef USE_MQTT_THINGSBOARD
+bool MqttThingsBoardSubscribe(void) {
+  // No loop() here: finish connection initialization before dispatching RPC.
+  AddLog(LOG_LEVEL_DEBUG, PSTR(D_LOG_MQTT D_SUBSCRIBE_TO " %s"), kMqttThingsBoardRpcSubscribe);
+  return MqttClient.subscribe(kMqttThingsBoardRpcSubscribe, 0);
+}
+#endif
+
 void MqttUnsubscribeLib(const char *topic) {
+#ifndef USE_MQTT_THINGSBOARD
   MqttClient.unsubscribe(topic);
   MqttClient.loop();  // Solve LmacRxBlk:1 messages
+#endif  // USE_MQTT_THINGSBOARD
 }
 
 bool MqttPublishLib(const char* topic, const uint8_t* payload, unsigned int plength, bool retained) {
+#ifdef USE_MQTT_THINGSBOARD
+  bool rpc_response = MqttThingsBoardRequestId(topic, kMqttThingsBoardRpcResponse) != nullptr;
+  if (strcmp(topic, kMqttThingsBoardTelemetry) && strcmp(topic, kMqttThingsBoardAttributes) && !rpc_response) {
+    return false;  // The caller still logs the local command response.
+  }
+  // A responses array adds two containers around an original JSON result.
+  if (!MqttThingsBoardJson::IsObject(payload, plength, rpc_response ? 18 : 16)) {
+    AddLog(LOG_LEVEL_INFO, PSTR(D_LOG_MQTT "ThingsBoard requires a JSON object (maximum nesting %u)"), rpc_response ? 18 : 16);
+    return false;
+  }
+  retained = false;
+#else
   // If Prefix1 equals Prefix2 disable next MQTT subscription to prevent loop
   if (!strcmp(SettingsText(SET_MQTTPREFIX1), SettingsText(SET_MQTTPREFIX2))) {
-    char *str = strstr(topic, SettingsText(SET_MQTTPREFIX1));
+    const char *str = strstr(topic, SettingsText(SET_MQTTPREFIX1));
     if (str == topic) {
       TasmotaGlobal.mqtt_cmnd_blocked_reset = 4;  // Allow up to four seconds before resetting residual cmnd blocks
       TasmotaGlobal.mqtt_cmnd_blocked++;
     }
   }
+#endif  // USE_MQTT_THINGSBOARD
 
 #ifdef USE_TASMESH
  if (MESHrouteMQTTtoMESH(topic, (char*)payload, retained)) {  // If we are a node, send this via ESP-Now
@@ -578,7 +611,60 @@ bool MqttPublishLib(const char* topic, const uint8_t* payload, unsigned int plen
   return true;
 }
 
+#ifdef USE_MQTT_THINGSBOARD
+void MqttThingsBoardRpcReply(const char *topic, const char *payload) {
+  // A command may have just disabled MQTT. Reply over the current connection
+  // while it is still open; do not change the newly saved setting.
+  if (!MqttPublishLib(topic, reinterpret_cast<const uint8_t*>(payload), strlen(payload), false)) {
+    AddLog(LOG_LEVEL_INFO, PSTR(D_LOG_MQTT "ThingsBoard RPC response failed: %s"), topic);
+  }
+}
+
+void MqttThingsBoardRpcData(const char *topic, const uint8_t *payload, size_t length) {
+  const char *id = MqttThingsBoardRequestId(topic, kMqttThingsBoardRpcRequest);
+  if (!id) { return; }
+  char reply_topic[sizeof(kMqttThingsBoardRpcResponse) + 10];
+  // Both topic and payload belong to the MQTT buffer, which publishing reuses.
+  snprintf_P(reply_topic, sizeof(reply_topic), PSTR("%s%s"), kMqttThingsBoardRpcResponse, id);
+  if (MqttThingsBoardRpcActive) {
+    MqttThingsBoardRpcReply(reply_topic, "{\"error\":\"Busy\"}");
+    return;
+  }
+  if (length >= MQTT_MAX_PACKET_SIZE || !MqttThingsBoardJson::IsObject(payload, length)) {
+    MqttThingsBoardRpcReply(reply_topic, "{\"error\":\"InvalidRequest\"}");
+    return;
+  }
+  char *command = static_cast<char*>(malloc(length + 1));
+  if (!command) {
+    MqttThingsBoardRpcReply(reply_topic, "{\"error\":\"OutOfMemory\"}");
+    return;
+  }
+  if (!MqttThingsBoardJson::Command(payload, length, command, length + 1, CMDSZ)) {
+    free(command);
+    MqttThingsBoardRpcReply(reply_topic, "{\"error\":\"InvalidRequest\"}");
+    return;
+  }
+
+  MqttThingsBoardRpcResults results;
+  ResponseClear();
+  MqttThingsBoardRpcActive = &results;
+  TasmotaGlobal.last_source = SRC_MQTT;
+  ExecuteCommand(command, SRC_MQTT);
+  if (results.Empty()) { results.Append(ResponseData()); }
+  MqttThingsBoardRpcActive = nullptr;
+  free(command);
+  MqttThingsBoardRpcReply(reply_topic, results.Payload());
+}
+
+void MqttThingsBoardRpcCapture(const char *payload) {
+  if (MqttThingsBoardRpcActive) { MqttThingsBoardRpcActive->Append(payload); }
+}
+#endif
+
 void MqttDataHandler(char* mqtt_topic, uint8_t* mqtt_data, unsigned int data_len) {
+#ifdef USE_MQTT_THINGSBOARD
+  MqttThingsBoardRpcData(mqtt_topic, mqtt_data, data_len);
+#else
   SHOW_FREE_MEM(PSTR("MqttDataHandler"));
 
   // Do not allow more data than would be feasable within stack space
@@ -674,6 +760,7 @@ void MqttDataHandler(char* mqtt_topic, uint8_t* mqtt_data, unsigned int data_len
   String payload = "{\"status\": \"success\"}";
   MqttClient.publish(response_topic.c_str(),payload.c_str());
   #endif
+#endif  // USE_MQTT_THINGSBOARD
 }
 
 /*********************************************************************************************/
@@ -683,16 +770,21 @@ void MqttRetryCounter(uint8_t value) {
 }
 
 void MqttSubscribe(const char *topic) {
+#ifndef USE_MQTT_THINGSBOARD
   AddLog(LOG_LEVEL_DEBUG, PSTR(D_LOG_MQTT D_SUBSCRIBE_TO " %s"), topic);
   MqttSubscribeLib(topic);
+#endif
 }
 
 void MqttUnsubscribe(const char *topic) {
+#ifndef USE_MQTT_THINGSBOARD
   AddLog(LOG_LEVEL_DEBUG, PSTR(D_LOG_MQTT D_UNSUBSCRIBE_FROM " %s"), topic);
   MqttUnsubscribeLib(topic);
+#endif
 }
 
 void MqttPublishLoggingAsync(bool refresh) {
+#ifndef USE_MQTT_THINGSBOARD
   static uint32_t index = 1;
 
   if (!Settings->mqttlog_level || !Settings->flag.mqtt_enabled || !Mqtt.connected) { return; }  // SetOption3 - Enable MQTT
@@ -705,6 +797,7 @@ void MqttPublishLoggingAsync(bool refresh) {
     GetTopic_P(stopic, STAT, TasmotaGlobal.mqtt_topic, PSTR("LOGGING"));
     MqttPublishLib(stopic, (const uint8_t*)line, len -1, false);
   }
+#endif
 }
 
 void MqttPublishPayload(const char* topic, const char* payload, uint32_t binary_length = 0, bool retained = false, uint32_t log_level = LOG_LEVEL_INFO);
@@ -721,7 +814,15 @@ void MqttPublishPayload(const char* topic, const char* payload, uint32_t binary_
     retained = false;                                    // Some brokers don't support retained, they will disconnect if received
   }
 
+#ifdef USE_MQTT_THINGSBOARD
+  retained = false;
+  if (binary_data) {
+    AddLog(LOG_LEVEL_INFO, PSTR(D_LOG_MQTT "ThingsBoard does not support binary Publish"));
+  }
+  bool published = (!binary_data && Settings->flag.mqtt_enabled && MqttPublishLib(topic, (const uint8_t*)payload, binary_length, retained));
+#else
   bool published = (Settings->flag.mqtt_enabled && MqttPublishLib(topic, (const uint8_t*)payload, binary_length, retained));  // SetOption3 - Enable MQTT
+#endif
   if (log_level > LOG_LEVEL_NONE) {
     // To lower heap usage the payload is not copied to the heap but used directly
     String log_data_topic;                               // 20210420 Moved to heap to solve tight stack resulting in exception 2
@@ -734,7 +835,7 @@ void MqttPublishPayload(const char* topic, const char* payload, uint32_t binary_
       log_data_topic += topic;                           // stat/tasmota/STATUS2
     } else {
       log_data_topic = F(D_LOG_RESULT);                  // RSL:
-      char *command = strrchr(topic, '/');               // If last part of topic it is always the command
+      const char *command = strrchr(topic, '/');         // If last part of topic it is always the command
       log_data_topic += (command == nullptr) ? topic : command +1;  // STATUS2
       retained = false;                                  // Without MQTT enabled there is no retained message
     }
@@ -806,6 +907,22 @@ void MqttPublishPayloadPrefixTopic_P(uint32_t prefix, const char* subtopic, cons
   prefix 6 = tele using subtopic or RESULT
 */
   SHOW_FREE_MEM(PSTR("MqttPublishPayloadPrefixTopic_P"));
+#ifdef USE_MQTT_THINGSBOARD
+  // Classify before FullTopic, Prefix and SetOption4 can change the topic.
+  if ((prefix & 3) == STAT && !binary_length) { MqttThingsBoardRpcCapture(payload); }
+  const char *thingsboard_topic = nullptr;
+  if ((prefix & 3) == TELE) {
+    if (!strcmp_P(D_RSLT_STATE, subtopic) || !strcmp_P(D_RSLT_SENSOR, subtopic)) {
+      thingsboard_topic = kMqttThingsBoardTelemetry;
+    } else if (!strcmp_P(D_RSLT_INFO "1", subtopic) || !strcmp_P(D_RSLT_INFO "2", subtopic) || !strcmp_P(D_RSLT_INFO "3", subtopic)) {
+      thingsboard_topic = kMqttThingsBoardAttributes;
+    }
+  }
+  if (thingsboard_topic) {
+    MqttPublishPayload(thingsboard_topic, payload, binary_length, false);
+    return;
+  }
+#endif
 /*
   char romram[64];                      // Claim 64 bytes from 4k stack
   snprintf_P(romram, sizeof(romram), ((prefix > 3) && !Settings->flag.mqtt_response) ? S_RSLT_RESULT : subtopic);  // SetOption4 - Switch between MQTT RESULT or COMMAND
@@ -830,7 +947,7 @@ void MqttPublishPayloadPrefixTopic_P(uint32_t prefix, const char* subtopic, cons
   free(romram);                         // Free 16k heap from 64 bytes
   MqttPublishPayload(stopic, payload, binary_length, retained);
 
-#if defined(USE_MQTT_CLIENT_CERT) || defined(USE_MQTT_AWS_IOT_LIGHT)
+#if !defined(USE_MQTT_THINGSBOARD) && (defined(USE_MQTT_CLIENT_CERT) || defined(USE_MQTT_AWS_IOT_LIGHT))
   if ((prefix > 0) && (Settings->flag4.awsiot_shadow) && (Mqtt.connected)) {    // placeholder for SetOptionXX
     // compute the target topic
     char *topic = SettingsText(SET_MQTT_TOPIC);
@@ -939,6 +1056,9 @@ void MqttPublishPowerState(uint32_t device) {
       snprintf_P(scommand, sizeof(scommand), PSTR(D_CMND_FANSPEED));
       GetTopic_P(stopic, STAT, TasmotaGlobal.mqtt_topic, (Settings->flag.mqtt_response) ? scommand : S_RSLT_RESULT);  // SetOption4 - Switch between MQTT RESULT or COMMAND
       Response_P(S_JSON_COMMAND_NVALUE, scommand, GetFanspeed());
+#ifdef USE_MQTT_THINGSBOARD
+      MqttThingsBoardRpcCapture(ResponseData());
+#endif
       MqttPublish(stopic);
     }
   } else {
@@ -946,6 +1066,9 @@ void MqttPublishPowerState(uint32_t device) {
     GetPowerDevice(scommand, device, sizeof(scommand), Settings->flag.device_index_enable);           // SetOption26 - Switch between POWER or POWER1
     GetTopic_P(stopic, STAT, TasmotaGlobal.mqtt_topic, (Settings->flag.mqtt_response) ? scommand : S_RSLT_RESULT);  // SetOption4 - Switch between MQTT RESULT or COMMAND
     Response_P(S_JSON_COMMAND_SVALUE, scommand, GetStateText(bitRead(TasmotaGlobal.power, device -1)));
+#ifdef USE_MQTT_THINGSBOARD
+    MqttThingsBoardRpcCapture(ResponseData());
+#endif
     MqttPublish(stopic);
 
     if (!Settings->flag4.only_json_message) {  // SetOption90 - Disable non-json MQTT response
@@ -1035,6 +1158,12 @@ void MqttConnected(void) {
     Mqtt.retry_counter_multiplier = 1;
     Mqtt.connect_count++;
 
+#ifdef USE_MQTT_THINGSBOARD
+    if (!MqttThingsBoardSubscribe()) {
+      MqttDisconnected(MQTT_CONNECT_FAILED);
+      return;
+    }
+#else
     GetTopic_P(stopic, TELE, TasmotaGlobal.mqtt_topic, S_LWT);
     Response_P(PSTR(MQTT_LWT_ONLINE));
     MqttPublish(stopic, true);
@@ -1061,6 +1190,7 @@ void MqttConnected(void) {
     }
 
     XdrvCall(FUNC_MQTT_SUBSCRIBE);
+#endif  // USE_MQTT_THINGSBOARD
   }
 
   if (Mqtt.initial_connection_state) {
@@ -1118,6 +1248,23 @@ void MqttConnected(void) {
   if (Settings->flag.mqtt_enabled) {  // SetOption3 - Enable MQTT
     TasmotaGlobal.rules_flag.mqtt_connected = 1;
   }
+}
+
+bool MqttConnectLib(const char *mqtt_user, const char *mqtt_pwd) {
+#ifdef USE_MQTT_THINGSBOARD
+  if (!mqtt_user || !mqtt_user[0]) {
+    AddLog(LOG_LEVEL_INFO, PSTR(D_LOG_MQTT "ThingsBoard requires an access token in MqttUser"));
+    return false;
+  }
+  // Access-token authentication, no password or will, and no stored subscriptions.
+  return MqttClient.connect(TasmotaGlobal.mqtt_client, mqtt_user, nullptr, nullptr, 0, false, nullptr, true);
+#else
+  char stopic[TOPSZ];
+  GetTopic_P(stopic, TELE, TasmotaGlobal.mqtt_topic, S_LWT);
+  Response_P(S_LWT_OFFLINE);
+  return MqttClient.connect(TasmotaGlobal.mqtt_client, mqtt_user, mqtt_pwd, stopic, 1,
+                           !Settings->flag4.mqtt_no_retain, ResponseData(), !Settings->flag5.mqtt_persistent);
+#endif
 }
 
 void MqttReconnect(void) {
@@ -1250,17 +1397,7 @@ void MqttReconnect(void) {
   MqttNonTLSWarning();
 #endif  // USE_MQTT_TLS
 
-  char stopic[TOPSZ];
-  GetTopic_P(stopic, TELE, TasmotaGlobal.mqtt_topic, S_LWT);
-  Response_P(S_LWT_OFFLINE);
-  if (MqttClient.connect(TasmotaGlobal.mqtt_client,
-                         mqtt_user,
-                         mqtt_pwd,
-                         stopic,                                         // Will topic
-                         1,                                              // Will QoS
-                         Settings->flag4.mqtt_no_retain ? false : true,  // No retained last will if "no_retain",
-                         ResponseData(),                                 // Will message
-                         Settings->flag5.mqtt_persistent ? 0 : 1)) {     // Clean Session
+  if (MqttConnectLib(mqtt_user, mqtt_pwd)) {
 #ifdef USE_MQTT_TLS
     if (Mqtt.mqtt_tls) {
 #ifdef ESP8266

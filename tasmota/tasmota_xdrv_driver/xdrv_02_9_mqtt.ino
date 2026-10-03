@@ -909,9 +909,12 @@ void MqttPublishPayloadPrefixTopic_P(uint32_t prefix, const char* subtopic, cons
   SHOW_FREE_MEM(PSTR("MqttPublishPayloadPrefixTopic_P"));
 #ifdef USE_MQTT_THINGSBOARD
   // Classify before FullTopic, Prefix and SetOption4 can change the topic.
-  if ((prefix & 3) == STAT && !binary_length) { MqttThingsBoardRpcCapture(payload); }
   const char *thingsboard_topic = nullptr;
-  if ((prefix & 3) == TELE) {
+  if ((prefix & 3) == STAT) {
+    // RESULT and named command responses also update telemetry outside RPC.
+    if (!binary_length) { MqttThingsBoardRpcCapture(payload); }
+    thingsboard_topic = kMqttThingsBoardTelemetry;
+  } else if ((prefix & 3) == TELE) {
     if (!strcmp_P(D_RSLT_STATE, subtopic) || !strcmp_P(D_RSLT_SENSOR, subtopic)) {
       thingsboard_topic = kMqttThingsBoardTelemetry;
     } else if (!strcmp_P(D_RSLT_INFO "1", subtopic) || !strcmp_P(D_RSLT_INFO "2", subtopic) || !strcmp_P(D_RSLT_INFO "3", subtopic)) {
@@ -1057,9 +1060,10 @@ void MqttPublishPowerState(uint32_t device) {
       GetTopic_P(stopic, STAT, TasmotaGlobal.mqtt_topic, (Settings->flag.mqtt_response) ? scommand : S_RSLT_RESULT);  // SetOption4 - Switch between MQTT RESULT or COMMAND
       Response_P(S_JSON_COMMAND_NVALUE, scommand, GetFanspeed());
 #ifdef USE_MQTT_THINGSBOARD
-      MqttThingsBoardRpcCapture(ResponseData());
-#endif
+      MqttPublishPrefixTopic_P(STAT, scommand);
+#else
       MqttPublish(stopic);
+#endif
     }
   } else {
 #endif  // USE_SONOFF_IFAN
@@ -1067,9 +1071,10 @@ void MqttPublishPowerState(uint32_t device) {
     GetTopic_P(stopic, STAT, TasmotaGlobal.mqtt_topic, (Settings->flag.mqtt_response) ? scommand : S_RSLT_RESULT);  // SetOption4 - Switch between MQTT RESULT or COMMAND
     Response_P(S_JSON_COMMAND_SVALUE, scommand, GetStateText(bitRead(TasmotaGlobal.power, device -1)));
 #ifdef USE_MQTT_THINGSBOARD
-    MqttThingsBoardRpcCapture(ResponseData());
-#endif
+    MqttPublishPrefixTopic_P(STAT, scommand);
+#else
     MqttPublish(stopic);
+#endif
 
     if (!Settings->flag4.only_json_message) {  // SetOption90 - Disable non-json MQTT response
       GetTopic_P(stopic, STAT, TasmotaGlobal.mqtt_topic, scommand);
